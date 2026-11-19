@@ -168,6 +168,7 @@ class McoreEngineConfig(EngineConfig):
         override_ddp_config (dict[str, Any]): Override configuration for DDP.
         override_transformer_config (dict[str, Any]): Override configuration for transformer.
         use_mbridge (bool): Whether to enable bridge-based Megatron model construction.
+        bridge_class (Optional[str]): Fully qualified AutoBridge subclass for custom checkpoint loading.
         use_megatron_fsdp (bool): Whether to use Megatron-FSDP (Zero-3 sharding).
         pad_to_length (bool): Whether to round every packed micro-batch up to a bucket-aligned length.
         pad_to_length_bucket (int): Padding granularity on the global packed sequence.
@@ -203,6 +204,7 @@ class McoreEngineConfig(EngineConfig):
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
     override_mcore_model_config: dict[str, Any] = field(default_factory=dict)
     use_mbridge: bool = True
+    bridge_class: Optional[str] = None
     use_megatron_fsdp: bool = False
     strategy: str = "megatron"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)

@@ -42,6 +42,7 @@ from verl.utils.dynamic_cp_scheduler import (
     get_megatron_dynamic_cp_scheduler_cls,
     postprocess_dynamic_cp_batch,
 )
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron.router_replay_utils import (
@@ -338,8 +339,14 @@ class MegatronEngine(BaseEngine):
         self.provider = None
         from verl.models.mcore.bridge import AutoBridge
 
+        bridge_cls = AutoBridge
+        if self.engine_config.bridge_class is not None:
+            bridge_cls = load_class_from_fqn(self.engine_config.bridge_class, "Megatron bridge")
+            if not issubclass(bridge_cls, AutoBridge):
+                raise TypeError("Megatron bridge_class must be an AutoBridge subclass")
+
         # Use Megatron-Bridge to convert HF config to Megatron config
-        bridge = AutoBridge.from_hf_pretrained(
+        bridge = bridge_cls.from_hf_pretrained(
             self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
         )
         # Get Megatron provider and configure it
