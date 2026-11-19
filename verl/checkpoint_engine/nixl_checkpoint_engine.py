@@ -287,20 +287,24 @@ class NIXLCheckpointEngine(CheckpointEngine):
 
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        expected_workers = actor_wg_world_size + rollout_world_size
+        if min(actor_wg_world_size, rollout_world_size) < 1 or len(metadata) != expected_workers:
+            raise ValueError("NIXL requires one metadata entry per actor and rollout worker")
+        rollout_metadata = metadata[actor_wg_world_size:]
         actor_wg_kwargs = {
             "method": ["init_process_group"] * actor_wg_world_size,
             "rank": [0] + [-1] * (actor_wg_world_size - 1),
             "world_size": [rollout_world_size + 1] * actor_wg_world_size,
             "prev_agent_metadata": [None] * actor_wg_world_size,
-            "next_agent_metadata": [metadata[-rollout_world_size]] + [None] * (actor_wg_world_size - 1),
+            "next_agent_metadata": [rollout_metadata[0]] + [None] * (actor_wg_world_size - 1),
         }
 
         rollout_kwargs = {
             "method": ["init_process_group"] * rollout_world_size,
             "rank": list(range(1, rollout_world_size + 1)),
             "world_size": [rollout_world_size + 1] * rollout_world_size,
-            "prev_agent_metadata": [metadata[0]] + metadata[-rollout_world_size:-1],
-            "next_agent_metadata": metadata[-rollout_world_size + 1 :] + [None],
+            "prev_agent_metadata": [metadata[0]] + rollout_metadata[:-1],
+            "next_agent_metadata": rollout_metadata[1:] + [None],
         }
         return actor_wg_kwargs, rollout_kwargs
 
