@@ -132,6 +132,7 @@ class McoreOptimizerConfig(OptimizerConfig):
 
     Args:
         optimizer (str): Optimizer name; default is "adam".
+        optimizer_factory (Optional[str]): Fully qualified class with a build(model=..., config=...) method.
         lr (float): Learning rate.
         clip_grad (float): Gradient clipping norm.
         lr_warmup_init (float): Initial learning rate for warmup; defaults to 0.0.
@@ -192,6 +193,7 @@ class McoreOptimizerConfig(OptimizerConfig):
     """
 
     optimizer: str = "adam"
+    optimizer_factory: Optional[str] = None
     lr_warmup_init: float = 0.0
     lr_decay_steps: Optional[int] = None
     lr_decay_style: str = "linear"

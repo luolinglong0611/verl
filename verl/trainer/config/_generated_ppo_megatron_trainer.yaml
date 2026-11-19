@@ -17,6 +17,7 @@ actor_rollout_ref:
       - 0.999
       clip_grad: 1.0
       optimizer: adam
+      optimizer_factory: null
       lr_warmup_init: 0.0
       lr_decay_steps: null
       lr_decay_style: constant
@@ -560,6 +561,7 @@ critic:
     - 0.999
     clip_grad: 1.0
     optimizer: adam
+    optimizer_factory: null
     lr_warmup_init: 0.0
     lr_decay_steps: null
     lr_decay_style: constant

@@ -523,7 +523,11 @@ class MegatronEngine(BaseEngine):
             fp16=self.param_dtype == torch.float16,
             bf16=self.param_dtype == torch.bfloat16,
         )
-        optimizer = get_megatron_optimizer(model=self.module, config=optim_config_megatron)
+        build_optimizer = get_megatron_optimizer
+        if self.optimizer_config.optimizer_factory is not None:
+            factory = load_class_from_fqn(self.optimizer_config.optimizer_factory, "Megatron optimizer factory")
+            build_optimizer = factory.build
+        optimizer = build_optimizer(model=self.module, config=optim_config_megatron)
         register_megatron_training_hooks(self.module, optimizer)
         return optimizer
 
