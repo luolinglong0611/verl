@@ -22,6 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from verl import DataProto
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.rtp_rollout import load_rtp_server_adapter
 
 __all__ = ["BaseRollout"]
 
@@ -90,6 +91,7 @@ _ROLLOUT_REGISTRY = {
     ("vllm", "async"): "verl.workers.rollout.vllm_rollout.ServerAdapter",
     ("sglang", "async"): "verl.workers.rollout.sglang_rollout.sglang_rollout.ServerAdapter",
     ("trtllm", "async"): "verl.workers.rollout.trtllm_rollout.trtllm_rollout.ServerAdapter",
+    ("rtp", "async"): load_rtp_server_adapter,
 }
 
 
@@ -104,7 +106,10 @@ def get_rollout_class(rollout_name: str, mode: str = "async") -> type[BaseRollou
         The rollout class.
     """
     assert (rollout_name, mode) in _ROLLOUT_REGISTRY, f"Rollout {rollout_name} with mode {mode} not found"
-    fqdn = _ROLLOUT_REGISTRY[(rollout_name, mode)]
+    entry = _ROLLOUT_REGISTRY[(rollout_name, mode)]
+    if callable(entry):
+        return entry()
+    fqdn = entry
     module_name, class_name = fqdn.rsplit(".", 1)
     rollout_module = importlib.import_module(module_name)
     return getattr(rollout_module, class_name)

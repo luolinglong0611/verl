@@ -28,6 +28,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.rtp_rollout import load_rtp_replica
 
 logger = logging.getLogger(__file__)
 
@@ -405,6 +406,7 @@ def _load_trtllm():
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
+RolloutReplicaRegistry.register("rtp", load_rtp_replica)
 
 
 def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False) -> type[RolloutReplica]:
