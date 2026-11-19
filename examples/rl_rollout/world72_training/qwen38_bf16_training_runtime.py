@@ -1,0 +1,681 @@
+# Copyright 2026 the contributors to this fork
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Explicit opt-in verl integration for the pinned 72-rank BF16 policy/state path.
+
+Import through actor_rollout_ref.model.external_lib. Nothing patches installed
+files. All hooks are restricted to the exact Qwen3.8 config and 72-rank mesh.
+The RTP bridge must acknowledge each source lease and actual native teardown.
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+import json
+import math
+import os
+import socket
+import time
+from pathlib import Path
+
+from .qwen38_bf16_streamed_checkpoint import (
+    is_qwen38,
+    load_checkpoint_shards,
+    meta_checkpoint_model,
+    restore_initialized_buffers_after_engine_cast,
+)
+from .qwen38_training_contract import POLICY_NUMEL, WORLD_SIZE
+
+_INSTALLED = False
+
+
+def _reclaim_action_timeout_seconds(value):
+    # The final value must be bound by the production plan and justified by
+    # same-scale timing; accepting a range is not a timing qualification.
+    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        raise ValueError("An explicit bounded reclaim action timeout is required")
+    value = int(value)
+    if not 121 <= value <= 3600:
+        raise ValueError("Reclaim action timeout outside reviewed bounds")
+    return value
+
+
+def _is_target(engine):
+    return is_qwen38(engine.model_config.hf_config)
+
+
+def _optimizer_step_after_global_clip(engine, norm, reduce_changed, update_vote=None):
+    """Opt-in acceptance gate; leave valid optimizer arithmetic untouched."""
+    required = os.environ.get("RLLM_REQUIRE_REAL_UPDATE") == "1"
+    engine._q38_last_real_update_gate = dict(
+        enabled=required, global_gradient_norm=float(norm), global_changed_weight_elements=None
+    )
+    if required and (not math.isfinite(float(norm)) or norm <= 0):
+        raise RuntimeError(
+            "RLLM_REQUIRE_REAL_UPDATE refuses nonpositive/nonfinite global gradients before Adam allocation/scan"
+        )
+    error = None
+    try:
+        engine.optimizer.step()
+    except BaseException as exc:
+        error = exc
+    if update_vote is not None:
+        update_vote("optimizer", error)
+    if error is not None:
+        raise error
+    if required:
+        changed = int(reduce_changed(int(engine.optimizer.changed_weight_elements)))
+        engine._q38_last_real_update_gate["global_changed_weight_elements"] = changed
+        if changed <= 0:
+            raise RuntimeError(
+                "RLLM_REQUIRE_REAL_UPDATE refuses a successful step with no globally changed BF16 weights"
+            )
+        engine._q38_last_real_update_gate["changed_count_world_size"] = WORLD_SIZE
+
+
+def _poison_reuse_engine(engine):
+    engine._q38_update_poisoned = True
+    engine._q38_gradient_store._reuse_failed = True
+    engine.optimizer._reuse_failed = True
+    engine._q38_phases.phase = "failed"
+    holder = getattr(engine, "_q38_reclaim_cursor_holder", None)
+    cursor = holder.get("cursor") if isinstance(holder, dict) else None
+    if cursor is not None:
+        try:
+            cursor.close()
+        except BaseException as exc:
+            engine._q38_reclaim_close_error = type(exc).__name__
+
+
+def _require_unpoisoned(engine):
+    if getattr(engine, "_q38_update_poisoned", False) or engine._q38_phases.phase == "failed":
+        raise RuntimeError("Failed optimizer state forbids training, export and refit")
+
+
+def _require_batch_idle(engine):
+    _require_unpoisoned(engine)
+    if getattr(engine, "_q38_batch_in_progress", False):
+        raise RuntimeError("An uncommitted train batch forbids export, refit and checkpoints")
+
+
+def _reuse_world_vote(dist, group, phase, error, world):
+    rank = dist.get_rank()
+    rows = [None] * world
+    value = dict(
+        rank=rank,
+        phase=phase,
+        passed=error is None,
+        error=None if error is None else type(error).__name__ + ": " + str(error),
+    )
+    dist.all_gather_object(rows, value, group=group)
+    if {r.get("rank") for r in rows} != set(range(world)) or any(
+        r.get("phase") != phase or r.get("passed") is not True for r in rows
+    ):
+        raise RuntimeError("A rank failed " + phase + "; partial updates are not rolled back")
+    return rows
+
+
+def _write_reuse_world_commit(engine, rank, world, votes):
+    directory = Path(os.environ["Q38_TRAINING_AUDIT_DIR"])
+    directory.mkdir(parents=True, exist_ok=True)
+    steps = engine.optimizer.audit()["steps"]
+    if len(steps) != 1:
+        raise RuntimeError("World commit needs exactly one Adam step")
+    record = dict(
+        schema="q38-reuse-world-update-vote-v1",
+        run_id=os.environ["Q38_RUN_ID"],
+        rank=rank,
+        pid=os.getpid(),
+        world_size=world,
+        step=steps[0],
+        post_update_votes=votes,
+        recorded_ns=time.time_ns(),
+        partial_failure_is_not_rolled_back=True,
+    )
+    path = directory / f"reuse-world-commit-rank{rank}-step{steps[0]}-{record['recorded_ns']}.json"
+    with path.open("x") as stream:
+        json.dump(record, stream)
+        stream.write("\n")
+    return str(path)
+
+
+def _run_reuse_update(engine, norm, reduce_changed, audit, dist, world, commit_writer=None):
+    """No rank leaves for refit until step and audit/clear votes succeed."""
+    group = engine._q38_cpu_admission_group
+    vote = lambda phase, error: _reuse_world_vote(dist, group, phase, error, world)
+    failure = None
+    try:
+        _optimizer_step_after_global_clip(engine, norm, reduce_changed, update_vote=vote)
+        audit(engine, "optimizer-step")
+        if engine._q38_gradient_store._reuse_frozen:
+            engine.optimizer.clear_first_reuse_before_world_vote()
+        else:
+            engine.optimizer.zero_grad()
+    except BaseException as exc:
+        failure = exc
+    try:
+        rows = vote("post-update-audit-and-clear", failure)
+        if failure is not None:
+            raise failure
+        commit_error = None
+        commit_path = None
+        try:
+            commit_path = (commit_writer or _write_reuse_world_commit)(engine, dist.get_rank(), world, rows)
+        except BaseException as exc:
+            commit_error = exc
+        vote("world-commit-evidence", commit_error)
+        if commit_error is not None:
+            raise commit_error
+        if engine._q38_gradient_store._reuse_frozen:
+            engine.optimizer.release_first_reuse_after_world_commit()
+        engine._q38_reuse_world_commit = commit_path
+    except BaseException:
+        _poison_reuse_engine(engine)
+        raise
+
+
+def _audit(engine, boundary):
+    import torch.distributed as dist
+
+    directory = Path(os.environ["Q38_TRAINING_AUDIT_DIR"])
+    directory.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema": "qwen38-BF16-state-engine-boundary-v1",
+        "boundary": boundary,
+        "rank": dist.get_rank(),
+        "world_size": dist.get_world_size(),
+        "time_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "phase": engine._q38_phases.phase,
+        "optimizer": engine.optimizer.audit(),
+        "phase_transition_records": engine._q38_phases.transition_records,
+        "real_update_gate": getattr(engine, "_q38_last_real_update_gate", None),
+        "native_contexts_released": getattr(engine, "_q38_native_contexts_released", False),
+        "last_native_cleanup_proof": getattr(engine, "_q38_last_native_cleanup_proof", None),
+        "last_refit_source_release": getattr(engine, "_q38_last_refit_source_release", None),
+        "initial_policy_replay_proof": getattr(engine, "_q38_initial_policy_replay_proof", None),
+    }
+    with (directory / f"{boundary}-rank{dist.get_rank()}-{record['time_ns']}.json").open("x") as stream:
+        json.dump(record, stream)
+        stream.write("\n")
+
+
+def install():
+    global _INSTALLED
+    if _INSTALLED:
+        return
+    if os.environ.get("Q38_ENABLE_BF16_STATE_RUNTIME") != "1":
+        raise RuntimeError("Explicit Q38_ENABLE_BF16_STATE_RUNTIME=1 is required")
+    import torch
+    import torch.distributed as dist
+
+    # The current base image's cuDNN SDPA plugin has a sublibrary mismatch.
+    # Keep native Torch SDPA Flash/math dispatch, with cuDNN SDPA excluded.
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    import verl.models.transformers.monkey_patch as monkey_patch
+    import verl.utils.fsdp_utils as fsdp_utils
+    import verl.utils.model as model_utils
+    import verl.workers.engine.fsdp.transformer_impl as engine_module
+
+    from .qwen38_bf16_master_phases import MasterPhaseManager, disable_prefetch_and_bound_reduction
+    from .qwen38_bf16_optimizer import Bf16CpuAdamW, CpuBf16Moments, GradientStore, local
+    from .qwen38_canonical_export import CanonicalExport
+    from .qwen38_chunked_experts import ExpertChunk, shard_expert_chunks_before_decoder_wrap
+    from .qwen38_policy_probe import audit_policy_before_rollout
+    from .qwen38_vocab_tiles import VocabTile, shard_vocab_tiles_before_root_wrap
+
+    Engine = engine_module.FSDPEngine
+    from verl.workers.engine.base import BaseEngineCtx
+
+    original_context_switch = BaseEngineCtx._context_switch
+    if list(inspect.signature(engine_module.fsdp2_load_full_state_dict).parameters) != [
+        "model",
+        "full_state",
+        "device_mesh",
+        "cpu_offload",
+    ]:
+        raise RuntimeError("Review the actual verl checkpoint-streaming hook signature")
+    original_factory = model_utils.get_hf_auto_model_class
+    original_patch = monkey_patch.apply_monkey_patch
+    original_wrap = engine_module.apply_fsdp2
+    original_load = engine_module.fsdp2_load_full_state_dict
+    original_optimizer = Engine._build_optimizer
+    original_build_module = Engine._build_module
+    original_step = Engine.optimizer_step
+    original_to = Engine.to
+    original_export = Engine.get_per_tensor_param
+    original_save = Engine.save_checkpoint
+
+    def factory(hf_config):
+        base = original_factory(hf_config)
+        if not is_qwen38(hf_config):
+            return base
+
+        class Qwen38MetaAuto:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                # The real verl engine passes config= explicitly. Consume it
+                # before forwarding the selected config positionally, while
+                # retaining the original exact-instance guard.
+                options = dict(kwargs)
+                if options.pop("config", hf_config) is not hf_config:
+                    raise ValueError("The selected Qwen3.8 config instance must be preserved")
+                return meta_checkpoint_model(base, hf_config, *args, **options)
+
+        return Qwen38MetaAuto
+
+    def patch(model, ulysses_sp_size=1, use_remove_padding=True, use_fused_kernels=False, **kwargs):
+        if not is_qwen38(model.config):
+            return original_patch(
+                model,
+                ulysses_sp_size=ulysses_sp_size,
+                use_remove_padding=use_remove_padding,
+                use_fused_kernels=use_fused_kernels,
+                **kwargs,
+            )
+        if ulysses_sp_size != 1 or use_remove_padding or use_fused_kernels:
+            raise ValueError("Initial Qwen3.8 validation uses real HF padded SP1 unfused forward")
+        if not hasattr(model, "_qwen38_expert_sources"):
+            raise RuntimeError("The exact meta-only expert subdivision was not applied")
+
+    def wrap(module, fsdp_kwargs, engine_config):
+        if not is_qwen38(module.config):
+            return original_wrap(module, fsdp_kwargs, engine_config)
+        if (
+            engine_config.strategy != "fsdp2"
+            or engine_config.fsdp_size != WORLD_SIZE
+            or fsdp_kwargs.get("offload_policy") is not None
+        ):
+            raise ValueError("Full CPU master offload and a partial-world mesh violate this resource profile")
+        mp = fsdp_kwargs.get("mp_policy")
+        if (
+            mp is None
+            or mp.param_dtype != torch.bfloat16
+            or mp.reduce_dtype != torch.float32
+            or fsdp_kwargs.get("reshard_after_forward") is not True
+        ):
+            raise ValueError("The fixed profile uses BF16 compute, FP32 gradient reduction and per-unit resharding")
+        shard_expert_chunks_before_decoder_wrap(module, fsdp_kwargs)
+        shard_vocab_tiles_before_root_wrap(module, fsdp_kwargs)
+        result = original_wrap(module, fsdp_kwargs, engine_config)
+        disable_prefetch_and_bound_reduction(module)
+        return result
+
+    def load(model, *args, **kwargs):
+        if is_qwen38(model.config):
+            return load_checkpoint_shards(model, *args, **kwargs)
+        return original_load(model, *args, **kwargs)
+
+    def build_module(self):
+        model = original_build_module(self)
+        if _is_target(self):
+            restore_initialized_buffers_after_engine_cast(model)
+        return model
+
+    def context_switch(context, device):
+        active = context.engine
+        if (
+            not context.disable_auto_offload
+            and str(device) != "cpu"
+            and isinstance(active, Engine)
+            and _is_target(active)
+            and hasattr(active, "_q38_phases")
+            and active._q38_phases.phase == "rollout"
+        ):
+            # Generic offload flags are deliberately false: a generic engine
+            # must never move the whole policy or optimizer. The custom phase
+            # still needs explicit restoration before HF eval/train. Engine.to
+            # independently requires the real complete-world cleanup proof.
+            active.to(device=device, model=True, optimizer=False, grad=False)
+        return original_context_switch(context, device)
+
+    def optimizer(self, module):
+        if not _is_target(self):
+            return original_optimizer(self, module)
+        if not getattr(module, "_qwen38_streaming_verified", False):
+            raise RuntimeError("Real source-coordinate and FSDP72 coverage validation must precede Adam allocation")
+        if (
+            self.scaler is not None
+            or getattr(self, "_qat_enabled", False)
+            or self.model_config.lora_rank > 0
+            or self.engine_config.forward_only
+        ):
+            raise ValueError("This is the full-policy BF16-storage/compute GRPO actor path")
+        if self.engine_config.model_dtype != "bf16":
+            raise ValueError("BF16 master storage must remain explicit")
+        self._is_offload_param = False
+        self._is_offload_optimizer = False
+        gradients = GradientStore(retained_bytes=int(os.environ.get("Q38_GPU_GRADIENT_CACHE_BYTES", 80 * 1024**3)))
+        params = list(module.parameters())
+        for name, p in module.named_parameters():
+            p._qwen36_parameter_name = name
+        gradients.register_hooks(params)
+        rank = dist.get_rank()
+        local_rank = int(os.environ.get("LOCAL_RANK", rank % 4))
+        # Pure CPU BF16 states; no pathname, mapped file, or disk fallback.
+        hot_node = int(os.environ.get("Q38_CPU_MOMENT_BYTES_PER_NODE", 512 * 1024**3))
+        hot_budget = hot_node // 4 + (local_rank < hot_node % 4)
+        moments = CpuBf16Moments(cpu_budget_bytes=hot_budget)
+        plan = moments.plan(module.named_parameters())
+        owned_numel = sum(local(p).numel() for p in params if p.requires_grad)
+        largest_gradient = max((local(p).numel() * 4 for p in params if p.requires_grad), default=0)
+        master_budget = int(os.environ.get("Q38_GPU_REFIT_MASTER_CACHE_BYTES", 24 * 1024**3))
+        largest_offload = max(
+            (
+                sum(local(p).numel() * local(p).element_size() for p in unit.parameters())
+                for unit in module.modules()
+                if isinstance(unit, ExpertChunk | VocabTile)
+            ),
+            default=0,
+        )
+        local_plan = {
+            "rank": rank,
+            "hostname": socket.gethostname(),
+            **plan,
+            "local_policy_numel": owned_numel,
+            "gpu_master_train_bytes": owned_numel * 2,
+            "gpu_FP32_gradient_cache_bytes": gradients.limit,
+            "cpu_gradient_spill_upper_bytes": max(0, owned_numel * 4 - gradients.limit + largest_gradient),
+            "gpu_rollout_master_budget_bytes": master_budget,
+            "cpu_rollout_master_upper_bytes": max(0, owned_numel * 2 - max(0, master_budget - largest_offload)),
+            "largest_local_gradient_bytes": largest_gradient,
+            "largest_local_offload_unit_bytes": largest_offload,
+            "cpu_reserved_bytes_per_node": int(os.environ.get("Q38_CPU_RESERVE_BYTES_PER_NODE", 96 * 1024**3)),
+        }
+        all_plans = [None for _ in range(WORLD_SIZE)]
+        dist.all_gather_object(all_plans, local_plan)
+        peers = [row for row in all_plans if row["hostname"] == local_plan["hostname"]]
+        if len(peers) != 4:
+            raise RuntimeError("Actual node placement must contain exactly four training ranks")
+        reserve = max(row["cpu_reserved_bytes_per_node"] for row in peers)
+        train_cpu = (
+            sum(row["planned_cpu_moment_bytes"] + row["cpu_gradient_spill_upper_bytes"] for row in peers) + reserve
+        )
+        rollout_cpu = (
+            sum(row["planned_cpu_moment_bytes"] + row["cpu_rollout_master_upper_bytes"] for row in peers) + reserve
+        )
+        cpu_limit = int(os.environ.get("Q38_VERIFIED_CPU_LIMIT_BYTES_PER_NODE", 800 * 1024**3))
+        if max(train_cpu, rollout_cpu) > cpu_limit:
+            raise MemoryError("The actual four-rank BF16 CPU state/FP32 gradient plan exceeds the verified RAM limit")
+        plan_path = Path(os.environ["Q38_TRAINING_AUDIT_DIR"]) / f"optimizer-placement-plan-rank{rank}.json"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        with plan_path.open("x") as stream:
+            json.dump(
+                {
+                    "rank_plan": local_plan,
+                    "node_plans": peers,
+                    "node_train_CPU_bytes_with_reserve": train_cpu,
+                    "node_rollout_CPU_bytes_with_reserve": rollout_cpu,
+                    "node_verified_CPU_limit_bytes": cpu_limit,
+                    "disk_offload_forbidden": True,
+                },
+                stream,
+                indent=2,
+            )
+        config = self.optimizer_config
+        if config.optimizer != "Bf16CpuAdamW" or config.optimizer_impl != __name__:
+            raise ValueError(
+                "The audited BF16 CPU-state optimizer must be explicitly selected in the run configuration"
+            )
+        options = {
+            "lr": config.lr,
+            "betas": tuple(config.betas),
+            "eps": float(getattr(config, "eps", 1e-8)),
+            "weight_decay": config.weight_decay,
+            "chunk_bytes": 8 * 1024**2,
+            "rounding_seed": int(os.environ.get("Q38_BF16_ROUNDING_SEED", 20261106)),
+        }
+        overrides = dict(config.override_optimizer_config or {})
+        if set(overrides) - {"lr", "betas", "eps", "weight_decay", "maximize"}:
+            raise ValueError("Review unsupported optimizer overrides instead of silently dropping them")
+        options.update(overrides)
+        reuse = os.environ.get("Q38_FIRST_ADAM_REUSE_CPU_SPILL") == "1"
+        if reuse and os.environ.get("Q38_CPU_FIRST_ADAM_ADMISSION_REQUIRED") != "1":
+            raise ValueError("First-Adam reuse requires the world-wide CPU admission gate")
+        options["reuse_cpu_spill"] = reuse
+        options["require_reuse_evidence"] = reuse
+        active = Bf16CpuAdamW(params, gradients=gradients, moments=moments, **options)
+        self._q38_gradient_store = gradients
+        self._q38_owned_numel = sum(local(p).numel() for p in params)
+        if os.environ.get("Q38_CPU_FIRST_ADAM_ADMISSION_REQUIRED") == "1":
+            # All ranks create this CPU-only group in the same constructor
+            # sequence; it must be separately qualified on the current 72 GPUs.
+            from datetime import timedelta
+
+            self._q38_cpu_admission_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=120))
+            if os.environ.get("Q38_NEXT_BATCH_CPU_ADMISSION_REQUIRED") == "1":
+                # Separate sequence space from the optimizer/CPU admission
+                # votes so a failed rank cannot match a different collective.
+                self._q38_batch_completion_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=120))
+            if os.environ.get("Q38_CPU_CACHE_RECLAIM_ENABLED") == "1":
+                reclaim_timeout = _reclaim_action_timeout_seconds(
+                    os.environ.get("Q38_CPU_RECLAIM_ACTION_TIMEOUT_SECONDS")
+                )
+                self._q38_cpu_reclaim_action_group = dist.new_group(
+                    backend="gloo", timeout=timedelta(seconds=reclaim_timeout)
+                )
+            self._q38_planned_moment_bytes = plan["planned_cpu_moment_bytes"]
+            self._q38_first_adam_admitted = False
+        self._q38_phases = MasterPhaseManager(
+            module,
+            gradients,
+            active,
+            leaf_predicate=lambda item: isinstance(item, ExpertChunk | VocabTile),
+            retained_bytes=int(os.environ.get("Q38_GPU_REFIT_MASTER_CACHE_BYTES", 24 * 1024**3)),
+        )
+        self._q38_native_contexts_released = False
+        self._q38_exporter = None
+        module.register_forward_pre_hook(lambda _module, _inputs: self._q38_phases.require_training())
+        return active
+
+    def _step_candidate(self):
+        if not _is_target(self):
+            return original_step(self)
+        self._q38_phases.require_training()
+        if self.scaler is not None:
+            raise RuntimeError("A loss scaler changes the reviewed BF16 gradient path")
+        norm = self._q38_gradient_store.clip_grad_norm(
+            self.optimizer_config.clip_grad,
+            expected_local_numel=self._q38_owned_numel,
+            expected_global_numel=POLICY_NUMEL,
+            collective_device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        if os.environ.get("Q38_CPU_FIRST_ADAM_ADMISSION_REQUIRED") == "1" and not self._q38_first_adam_admitted:
+            from .distributed_admission import first_adam_admission
+
+            first_adam_admission(self, dist, self._q38_cpu_admission_group, world=WORLD_SIZE)
+            self._q38_first_adam_admitted = True
+
+        def reduce_changed(count):
+            if not dist.is_initialized() or dist.get_world_size() != WORLD_SIZE:
+                raise RuntimeError("The real-update changed-weight count must cover all72 actor ranks")
+            changed = torch.tensor(count, device=torch.device("cuda", torch.cuda.current_device()), dtype=torch.int64)
+            dist.all_reduce(changed, op=dist.ReduceOp.SUM)
+            return changed.item()
+
+        if os.environ.get("Q38_FIRST_ADAM_REUSE_CPU_SPILL") == "1":
+            _run_reuse_update(self, norm, reduce_changed, _audit, dist, WORLD_SIZE)
+            return norm
+        _optimizer_step_after_global_clip(self, norm, reduce_changed)
+        _audit(self, "optimizer-step")
+        # This is the committed optimizer boundary; the fixed initial profile
+        # has one global minibatch per update. Retain the audit, then release
+        # every CPU/GPU reduced gradient before native inference can start.
+        self.optimizer.zero_grad()
+        return norm
+
+    def step(self):
+        if not _is_target(self):
+            return original_step(self)
+        _require_unpoisoned(self)
+        try:
+            return _step_candidate(self)
+        except BaseException:
+            if os.environ.get("Q38_FIRST_ADAM_REUSE_CPU_SPILL") == "1":
+                _poison_reuse_engine(self)
+            raise
+
+    def to(self, device, model=True, optimizer=True, grad=True):
+        if not _is_target(self) or not hasattr(self, "_q38_phases"):
+            return original_to(self, device, model=model, optimizer=optimizer, grad=grad)
+        _require_unpoisoned(self)
+        if str(device) == "cpu":
+            _require_batch_idle(self)
+            if model and self._q38_phases.phase == "train":
+                if self._q38_gradient_store.slots:
+                    raise RuntimeError("Explicit optimizer_zero_grad is required before the native rollout phase")
+                audit_policy_before_rollout(self)
+                self._q38_phases.prepare_rollout()
+                self._q38_native_contexts_released = False
+                _audit(self, "partial-master-offload")
+        elif torch.device(device).type == "cuda":
+            if self._q38_phases.phase == "rollout":
+                self._q38_phases.restore_training(
+                    native_contexts_released=self._q38_native_contexts_released,
+                    refit_sources_released=self._q38_exporter is None,
+                )
+                _audit(self, "partial-master-restore")
+        else:
+            raise ValueError("Only the exact allocated CUDA device or CPU phase is supported")
+        # CPU BF16 moments remain on CPU across generic engine.to.
+
+    def export(self, *args, **kwargs):
+        if not _is_target(self):
+            return original_export(self, *args, **kwargs)
+        _require_batch_idle(self)
+        if self._q38_phases.phase == "train":
+            audit_policy_before_rollout(self)
+            self._q38_phases.prepare_rollout()
+            self._q38_native_contexts_released = False
+        if self._q38_exporter is not None:
+            raise RuntimeError("Close the preceding native source session before exporting another policy version")
+        self._q38_exporter = CanonicalExport(self.module)
+        # The world adapter retains only this bound method across release; it
+        # carries no Tensor/source view and therefore cannot pin the backing.
+        self._q38_exporter.confirm_native_cleanup = self.q38_confirm_native_cleanup
+        return self._q38_exporter, None
+
+    def save_checkpoint(self, *args, **kwargs):
+        if _is_target(self):
+            _require_batch_idle(self)
+        return original_save(self, *args, **kwargs)
+
+    def confirm_cleanup(self, proof):
+        if not _is_target(self):
+            raise ValueError("Qwen3.8 cleanup proof applies only to its dedicated actor")
+        if (
+            not isinstance(proof, dict)
+            or proof.get("world_size") != WORLD_SIZE
+            or proof.get("all_owned_native_processes_exited") is not True
+            or proof.get("remaining_owned_gpu_contexts") != []
+            or len(proof.get("checked_native_ranks", [])) != WORLD_SIZE
+            or set(proof.get("checked_native_ranks", [])) != set(range(WORLD_SIZE))
+        ):
+            raise RuntimeError("Actual all-rank native process and GPU-context teardown evidence is required")
+        if self._q38_exporter is not None:
+            self._q38_last_refit_source_release = self._q38_exporter.close(all_owned_native_contexts_released=True)
+            self._q38_exporter = None
+        # Cleanup-only evidence frees borrowed source memory but must not grant
+        # training admission after a failed refit or missing all-world pause.
+        self._q38_native_contexts_released = (
+            proof.get("training_admission_safe") is True and proof.get("all_world_pause_acknowledged") is True
+        )
+        self._q38_last_native_cleanup_proof = proof
+        _audit(self, "native-cleanup-confirmed")
+
+    model_utils.get_hf_auto_model_class = factory
+    monkey_patch.apply_monkey_patch = patch
+    engine_module.apply_monkey_patch = patch
+    engine_module.apply_fsdp2 = wrap
+    engine_module.fsdp2_load_full_state_dict = load
+    if fsdp_utils.fsdp2_load_full_state_dict is original_load:
+        fsdp_utils.fsdp2_load_full_state_dict = load
+    Engine._build_module = build_module
+    BaseEngineCtx._context_switch = context_switch
+    Engine._build_optimizer = optimizer
+    Engine.optimizer_step = step
+    Engine.to = to
+    Engine.get_per_tensor_param = export
+    Engine.q38_confirm_native_cleanup = confirm_cleanup
+    Engine.save_checkpoint = save_checkpoint
+    # Actual verl's naive worker calls resume(weights) BEFORE it asks the
+    # model engine for exported parameters. Offload masters before that resume
+    # can allocate the native policy; otherwise 125GiB+native cannot fit.
+    import verl.workers.engine_workers as workers
+
+    original_worker_update = workers.ActorRolloutRefWorker.update_weights
+
+    @functools.wraps(original_worker_update)
+    async def update_before_native_resume(self, global_steps=None, mode="auto"):
+        actor = getattr(self, "actor", None)
+        active = getattr(actor, "engine", None)
+        if isinstance(active, Engine) and _is_target(active):
+            _require_batch_idle(active)
+            effective = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+            if effective != "naive":
+                raise ValueError("The single-instance leased source path requires direct colocated naive transfer")
+            if active._q38_phases.phase == "train":
+                audit_policy_before_rollout(active)
+                active._q38_phases.prepare_rollout()
+                active._q38_native_contexts_released = False
+                _audit(active, "partial-master-offload-before-native-resume")
+        return await original_worker_update(self, global_steps=global_steps, mode=mode)
+
+    update_before_native_resume._q38_offloads_before_native_resume = True
+    workers.ActorRolloutRefWorker.update_weights = update_before_native_resume
+
+    # The direct naive worker already passes the object unchanged. Preserve
+    # the same contract for callers of ColocatedCheckpointEngine.receive_weights
+    # whose original `yield from` would erase ACK/cleanup methods.
+    from verl.checkpoint_engine.base import ColocatedCheckpointEngine
+
+    original_receive = ColocatedCheckpointEngine.receive_weights
+
+    @functools.wraps(original_receive)
+    def receive(self, global_steps=None):
+        weights = getattr(self, "weights", None)
+        if isinstance(weights, CanonicalExport):
+            self.weights = None
+            return weights
+        return original_receive(self, global_steps=global_steps)
+
+    receive._q38_preserves_export_lease = True
+    ColocatedCheckpointEngine.receive_weights = receive
+    from .qwen38_policy_audit import install_policy_loss_audit
+
+    install_policy_loss_audit()
+    from .qwen38_memory_boundaries import install as install_memory_boundaries
+
+    install_memory_boundaries()
+    if os.environ.get("Q38_NEXT_BATCH_CPU_ADMISSION_REQUIRED") == "1":
+        if os.environ.get("Q38_CPU_FIRST_ADAM_ADMISSION_REQUIRED") != "1":
+            raise RuntimeError("Next-batch admission requires the first-Adam Gloo group and admission")
+        from .next_backward_admission import install_batch_boundary
+
+        expected = os.environ.get("Q38_VERL_TRAIN_BATCH_SOURCE_SHA256", "")
+        if expected != "dd5e7dba6b8f69b5955685c20823674199e24ba8395f9309f770f575c8bf2d66":
+            raise RuntimeError("Next-batch admission requires the reviewed train_batch source hash")
+        install_batch_boundary(
+            Engine,
+            dist,
+            expected_train_batch_sha256=expected,
+            on_failure=_poison_reuse_engine,
+            is_target=_is_target,
+            world=WORLD_SIZE,
+        )
+    _INSTALLED = True
+
+
+if os.environ.get("Q38_ENABLE_BF16_STATE_RUNTIME") == "1":
+    install()
